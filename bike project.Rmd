@@ -1,0 +1,197 @@
+---
+title: "project"
+author: "Xie Peilin"
+date: "2023-12-24"
+output: html_document
+---
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+library("RMySQL")
+library("arules")
+```
+# Objective
+-   I want to analyse a bike company based on its sales from January 1st 2021 to June 30th 2023. The problem will starting into two aspects:\
+    -   Analyse how to develop the sales strategy according to **Apriori Model**\, which will find the association between products. With the specific product selling well, the other products have a excellent sale if they have high association. 
+    -   In November 24th 2021, the bike company make a decision, it posts many discount coupons to customers. So I want to know how effect of this decision is. Based on the **Difference In Difference model**, I can know the whether this discount coupons play a improving role in order number or not fixed other Confounders like region difference, age, annual income, education level, occupation.
+
+ 
+# Modeling
+## 1.Combination Selling strategy
+### Data Preprocessing(Plus connect mysql database)
+-   Database description
+    -   this database has eight tables, and some of them have relationship using foreign key and primary key to connect.
+        -   product,product_categories,prodcuct_subcategories(belonging to production usage)
+        -   calendar,customer,territory(information table)
+        -   sales,return(record the shopping items)
+    -   In this scenario, I only use product and sales table under a connection(based on **ProductKey**). I gain the all **Product Name** under the splitting each **Order Number** into different groups
+```{r}
+mysqlconnection1 = dbConnect(MySQL(), user = 'root', password = 'XPL200815a',
+                            dbname = 'bike',host = 'localhost')
+
+#query multiple items each order
+result1 = dbSendQuery(mysqlconnection1, 
+             "
+              SELECT 
+              	T.OrderNumber,
+              	group_concat(ProductName separator ';') AS ProductName
+              FROM (	
+                  SELECT 
+                    OrderNumber,
+                    ProductName
+                  FROM sales s
+                  JOIN product p ON s.ProductKey = p.ProductKey
+                  ORDER BY OrderNumber
+              ) AS T
+              GROUP BY T.OrderNumber 
+              ORDER BY T.OrderNumber DESC
+              ")
+
+df1 = data.frame()
+
+# due to the restriction of input size for 'fetch' query function,so we set a batch to iterate total sample(each batch equal to 500)
+batch_size = 500  # batch size
+offset = 0  # initial the pointer
+repeat {
+  batch = fetch(result1, n = batch_size, offset = offset) 
+  if (nrow(batch) == 0) { 
+    break #stop the iteration,when total sample query completely.
+  }
+  df1 = rbind(df1, batch)
+  offset = offset + batch_size #each iteration will change the pointer to get the next 500 sample
+}
+
+#the columns is strings group, so we should split them into a list
+df_list = strsplit(df1$ProductName,split = ";")
+head(df_list)
+dbDisconnect(mysqlconnection1)
+
+```
+### Apriori Algorithm
+-   objective: find the relationship between item sets, for the stronger association groups,we can use **"package selling strategy"**,e.g. combination package will be better for customer in price. 
+-   Model Description
+    -   Definition: Apriori is a unique data mining model for association rules, which mainly deploy in looking for relationship between Data Sets.The principle assumes all subset of frequent item sets also satisfy frequent theory.
+    -   Important Indicators:
+        -   **support**: present frequency of a item set in all items sets(I think this not important in big sample, not reference meaningful)$$ S(x) = \frac{\sigma(x)}{N} $$ $S(x)$ is the degree of support,$\sigma(x)$ is the counts of a item set, $N$ is total number of item sets.
+        -   **confidence**: the degree of frequency of one item set given by other item set presented.$$ c(X \rightarrow Y) = \frac{\sigma(X \cup Y)}{\sigma(x)}$$
+        $c$ represents the confidence, $\sigma(X \cup Y)$ is the counts of both $X$ and $Y$ presented simultaneously.
+        -   **lift**: judge $X$ and $Y$ whether they are spurious association or not.Given $Y$ presented,the probability of $Y$ given $X$ presented.$$ lift(X \rightarrow Y) = \frac{p(Y|X)}{p(Y)} = \frac{p(X \cap Y)}{p(X)p(Y)} $$
+    
+    -   Working process:
+        -   Set the minimum support threshold and the minimum confidence threshold.
+        -   Scan the dataset to generate 1-itemsets and calculate their support. Filter out candidate itemsets with support below the minimum support threshold.
+        -   Iteratively Generate Higher-order Candidate Itemsets: For each k-1 frequent itemset, use join and prune operations to generate k-itemsets. Join operation combines frequent itemsets to form candidate itemsets, and prune operation removes candidate itemsets that do not satisfy the Apriori property. Calculate the support for each candidate itemset and filter out those below the minimum support threshold.
+        -   Repeat Step 3 until no higher-order candidate itemsets can be generated.
+        -   Generate Frequent Itemsets: Collect all candidate itemsets that meet the minimum support threshold as frequent itemsets.
+        -   Generate Association Rules: For each frequent itemset, generate all possible non-empty subsets and calculate their confidence. Filter out association rules with confidence below the minimum confidence threshold.
+        -   Output Results: Output the frequent itemsets and association rules.
+
+```{r}
+
+# create dummies variable for every product in order to input the Apriori algorithm
+df_trans = transactions(df_list)
+
+# mining the association
+rules = apriori(df_trans,
+                parameter = list(support = 0.01, confidence = 0.8))
+#I set the the low support, but control the higher confidence, since find the association of item sets
+
+#at the same time,in case of spurious relationship, so I also focus on the lift.
+rules_sorted = sort(rules,by="confidence",decreasing = TRUE) #sort by confidence
+inspect(rules_sorted)
+
+```
+
+-   Conclusion:
+    -   Customers who buy **Fender Set - Mountain** and **Water Bottle - 30 oz.** will be buy **Mountain Bottle Cage** , because confidence equal to 1.and there are higher lift, so it can be trusted.
+    -   there are also high confidence in other 4 samples, customers buy **Road Bottle Cage** or **Mountain Bottle Cage**, they have about 85% average probability to buy **Water Bottle - 30 oz.** , at the same time, the lift not equal to 1. So we may say most of customers of them will buy **Water Bottle - 30 oz.**
+    -   The same regulation, customer buying **Touring Tire** may buy **Touring Tire Tube** in high probability.
+    
+-   suggestions:
+    -   "combination and bundle selling" strategy, bike company can make selling strategy for the items with higher association. For example, company sell the **Road Bottle Cage** and **Water Bottle - 30 oz.** separately in the past, after finding the higher association between them, company can do a item pack containing both of them, and give a discount price to customers, it will be increase the order number in some degree.
+
+
+
+## 2.Certify Effect Of Sales Promotion
+### Data Preprocessing(extract from mysql)
+-   In this analysis aspect, I use the sales and customer table under a connection(based on **CustomerKey**). Before starting the DID model, many useful features need to be extracted.
+
+```{r}
+
+mysqlconnection2 = dbConnect(MySQL(), user = 'root', password = 'XPL200815a',
+                            dbname = 'bike',host = 'localhost')
+result2 = dbSendQuery(mysqlconnection2,
+                      "
+                      SELECT 
+                            AnnualIncome,
+                            SUM(OrderQuantity) AS OrderQuantity,
+                            OrderDate,
+                            c.CustomerKey,
+                            Territorykey,
+                            Year(OrderDate) - BirthYear AS age,
+                            Gender,
+                            EducationLevel,
+                            Occupation,
+                            HomeOwner,
+                            TotalChildren
+                      FROM sales s
+                      JOIN customer c ON s.CustomerKey = c.CustomerKey
+                      WHERE s.OrderDate BETWEEN '2021-10-24' AND '2021-12-24'
+                      GROUP BY OrderNumber
+                      Order BY s.OrderDate
+                      "
+)
+                    
+df2 = data.frame()
+
+# same operation
+offset = 0  # but initial the pointer
+repeat {
+  batch = fetch(result2, n = batch_size, offset = offset) 
+  if (nrow(batch) == 0) { 
+    break 
+  }
+  df2 = rbind(df2, batch)
+  offset = offset + batch_size 
+}
+
+dbDisconnect(mysqlconnection2)
+
+#transform to formal data type and give some condition
+df2$OrderDate = as.Date(df2$OrderDate)
+df2$OrderDate = ifelse(df2$OrderDate < '2021-11-24', 0, 1)#In the 2021-11-24, the company will post the sales promotion activities.before this time, it will assign the value 0, otherwise.
+df2$Territorykey = ifelse(df2$Territorykey %in% c(1,2,3,4,5),1,0)
+
+#characters type change to categories
+transform.categories = function(df.characters){return(match(df.characters,unique(df.characters)))}
+df2[c('Gender','EducationLevel','Occupation','HomeOwner')] = apply(df2[c('Gender','EducationLevel','Occupation','HomeOwner')],2,transform.categories)
+
+head(df2)
+
+```
+## Difference In Difference model
+-   Objectives: find the result of discount coupons whether it is effective nor not. The company posts this discount coupons in November 24th 2021 in the United States, so we can compare intervention differences between treatment group and control group.**(A2-A1)-(B2-B1)**
+
+![](DID.png)
+
+-   Model description
+$$ y = \beta_0 + \beta_1 G_i + \beta_2 D_t + \beta_3 (G_i \times D_t) + \epsilon_{it} $$
+    $G_i$ is grouping dummy variable(i=1 is treatment group, i=0 is control group),$D_t$ is time dummy variable(t=1 is after intervention, t=0 is before intervention),$G_i \times D_t$ is intersection under both of them.**factor effect**
+    
+    -   in the control group before intervention: $\beta_0$
+    -   in the treatment group before intervention : $\beta_0 + \beta_1$
+    -   in the control group after intervention: $\beta_0 + \beta_2$
+    -   in the treatment group after intervention: $\beta_0 + \beta_1 + \beta_2 + \beta_3$
+    -   so the factor effective is $\beta_3$ 
+
+![](principle.png)
+
+**Consider Annual income and Occupation as a confounders, it may impact the order quantity.For Age, Children number, Gender, Education level, these features are not significant impact order quntity, so I get rid of them.**
+```{r}
+#Territorykey*OrderDate + AnnualIncome + age + TotalChildren  + Gender + EducationLevel + Occupation
+model = lm(OrderQuantity ~  Territorykey*OrderDate + AnnualIncome + Occupation ,data = df2)
+summary(model)
+```
+-   conclusion:
+    In the summary table, we can know **this sales promotion in the United States hasn't impact on the order quantity.** because of insignificant intersection$(G_i \times D_t)$. However, I believe the time is right, since people will shop enough during the Christmas day. And the main reason bike company fail to improve the order quantity is competitive industry and less propaganda.
+    
+    
